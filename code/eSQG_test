@@ -1,0 +1,159 @@
+from numpy import diff
+import netCDF4 as nc
+import numpy as np
+from esqg_class import *
+
+def lonlat2xy(lon, lat):
+    """
+    Converts the given longitude and latitude arrays to x and y coordinates
+    using the WGS84 reference ellipsoid.
+
+    Parameters:
+        lon (ndarray): Array of longitudes
+        lat (ndarray): Array of latitudes
+
+    Returns:
+        x (ndarray): Array of x-coordinates
+        y (ndarray): Array of y-coordinates
+    """
+    from pylab import meshgrid, cos, pi
+    r = 6371.e3
+    lon = lon-lon[0]
+    if lon.ndim == 1:
+        lon, lat = meshgrid(lon, lat)
+    x = 2*pi*r*cos(lat*pi/180.)*lon/360.
+    y = 2*pi*r*lat/360.
+    return x, y
+
+
+def gradxy(lon, lat, d):
+    """
+    Calculate the x and y gradients of a field
+    lon: longitudes, 1- or 2-D
+    lat: latitudes, 1- or 2-D
+    d: field, 2- or 3-D
+
+    The calculated velocity fields share the same dimensions with d,
+    i.e. the velocity fields are shifted.
+    """
+    from numpy import c_,r_,diff,zeros
+    x, y = lonlat2xy(lon, lat)
+
+    def uv(x,y,d):
+        x = c_[x, x[:,-2]]
+        y = r_[y, y[-2,:].reshape(1,-1)]
+
+        sshx = c_[d, d[:,-1]]
+        v = diff(sshx,axis=1)/diff(x,axis=1)
+        v[:,-1] = v[:,-2]
+
+        sshy = r_[d, d[-1,:].reshape(1,-1)]
+        u = diff(sshy,axis=0)/diff(y,axis=0)
+        u[-2,:]=u[-1,:]
+        return u,v
+    if d.ndim == 2:
+        return uv(x,y,d)
+    elif d.ndim == 3:
+        u, v = zeros(d.shape), zeros(d.shape)
+        for i in range(d.shape[0]):
+            ut,vt = uv(x,y,d[i,:,:])
+            v[i,:,:] = vt
+            u[i,:,:] = ut
+        return u, v
+
+
+def psi2uv(lon, lat, d):
+    """
+    Calculate horizontal velocity from streamfunction.
+
+    Parameters
+    ----------
+    lon : 1D or 2D array-like
+        Longitudes
+    lat : 1D or 2D array-like
+        Latitudes
+    d : 2D or 3D array-like
+        Streamfunction
+
+    Returns
+    -------
+    u : 2D or 3D array-like
+        Zonal velocity
+    v : 2D or 3D array-like
+        Meridional velocity
+    """
+    u, v = gradxy(lon, lat, d)
+    u = -1 * u
+    return u, v
+
+
+def diff1(var):
+    '''
+    :var 1D or 2D or 3D
+    def diff2(z):
+    dz2 = np.zeros_like(z)
+    dz2[0] = z[1]-z[0]
+    for i in range(1, len(z)-1):
+            dz2[i] = z[i+1]-2*z[i]+z[i-1]
+    dz2[-1] = z[-1] - z[-2]
+    return dz2'''
+    if var.ndim == 1:
+        z = var[:]
+        zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+        zc = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+        dz = diff(zc)[1:-1]  # d\psi /dz (N+2)
+        return dz
+    elif var.ndim == 2:
+        zc = np.zeros([var.shape[0] + 3, var.shape[1]])
+        for i in range(var.shape[1]):
+            z = var[:, i]
+            zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+            zc[:, i] = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+        return diff(zc, axis=0)[1:-1, :]
+    elif var.ndim == 3:
+        zc = np.zeros([var.shape[0] + 3, var.shape[1], var.shape[2]])
+        for i in range(var.shape[1]):
+            for j in range(var.shape[2]):
+                z = var[:, i, j]
+                zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+                zc[:, i, j] = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+        return diff(zc, axis=0)[1:-1, :, :]
+
+
+def twopave(x):
+    return (x[0:-1]+x[1:])/2.
+
+
+d1 = nc.Dataset('path')
+lon = d1['lon'][:]
+lat = d1['lat'][:]
+z = d1['depth'][:]
+pd = d1['density'][:]
+ssh = d1['ssh'][:]
+
+g = 9.81
+rho0 = np.mean(pd[0, :, :])
+
+N2 = d1['N20'][:]  # 40 * 151 * 301
+N0 = np.mean(np.sqrt(N2))
+
+# Create an instance of esqg_data
+d = esqg_data()
+
+# Define variables for the instance
+d.z = -z  # 0-5000m, 共40层
+d.c = 1  # given constant
+d.n0 = N0  # given constant
+d.lon = lon
+d.lat = lat
+d.rho0 = rho0
+d.window_width = 10
+d.ssh = ssh
+
+# Solve the eSQG equation to obtain the density and velocity field
+d.solve_esqg()
+
+rho = -d.rho0 * d.f0 / d.g * diff1(d.psi) / diff1(np.array(-z)).reshape(-1, 1, 1)
+
+u = d.u
+v = d.v

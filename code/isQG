@@ -1,0 +1,321 @@
+# 导入需要的库
+from pylab import meshgrid
+from numpy import c_, r_, diff, zeros, diag, matrix, identity, arange
+from math import pi, sin
+import numpy as np
+import scipy.fftpack as fft
+import netCDF4 as nc
+import copy
+
+
+def lonlatxy(lon, lat):
+    """
+    Converts the given longitude and latitude arrays to x and y coordinates
+    using the WGS84 reference ellipsoid.
+
+    Parameters:
+        lon (ndarray): Array of longitudes
+        lat (ndarray): Array of latitudes
+
+    Returns:
+        x (ndarray): Array of x-coordinates
+        y (ndarray): Array of y-coordinates
+    """
+    from pylab import meshgrid, cos, pi
+    r = 6371.e3
+    lon = lon-lon[0]  # .nidm 表示数组维数
+    if lon.ndim == 1:
+        lon, lat = meshgrid(lon, lat)
+    x = 2*pi*r*cos(lat*pi/180.)*lon/360.
+    y = 2*pi*r*lat/360.
+    return x, y
+
+
+def anomaly(lon, lat, var):
+    """
+    Compute the anomaly of a variable with respect to its spatial mean.
+
+    Parameters
+    ----------
+    lon : Array of longitudes.
+    lat : Array of latitudes.
+    var : Array of variable values.
+
+    Returns
+    -------
+    anomaly : array-like
+        Anomaly of the variable with respect to its spatial mean.
+    """
+
+    if lon.ndim == 1:
+        y1, x1 = meshgrid(lon, lat)
+    else:
+        y1, x1 = lon, lat
+
+    if var.ndim == 2:
+        coef = fit2Dsurf(x1, y1, var)[0]
+        varm = fit2poly(coef, x1, y1)
+        return var - varm
+
+    elif var.ndim == 3:
+        tmp = zeros(var.shape)
+        for i in arange(var.shape[0]):
+            coef = fit2Dsurf(x1, y1, var[i, :, :])[0]
+            varm = fit2poly(coef, x1, y1)
+            tmp[i, :, :] = var[i, :, :] - varm
+        return tmp
+
+
+def fit2Dsurf(x, y, p):
+    """
+    Given y0=f(t0), find the best fit
+    p = a + bx + cy + dx**2 + ey**2 + fxy
+    and return a, b, c, d, e, f
+
+    :param x: 1D array of x values
+    :param y: 1D array of y values
+    :param p: 1D array of z values
+    :return: a tuple of coefficients (a, b, c, d, e, f)
+    """
+    from scipy.optimize import leastsq
+
+    def fit2poly(params, x, y, p):
+        a, b, c, d, e, f = params
+        err = p - (a + b * x + c * y + d * x**2 + e * y**2 + f * x * y)
+        return err
+
+    x = x.flatten()
+    y = y.flatten()
+    p = p.flatten()
+    params = np.array([p.mean(), 1e-3, 1e-3, 1e-6, 1e-6, 1e-6])
+    coefs = leastsq(fit2poly, params, args=(x, y, p))
+    return coefs
+
+
+def fit2poly(params, x, y):
+    """
+    Returns the polynomial fit p = a + bx + cy + dx**2 + ey**2 + fxy
+    given the coefficients c and input data x and y.
+
+    Parameters:
+        params (list): List of polynomial coefficients
+        x (ndarray): Array of x-values
+        y (ndarray): Array of y-values
+
+    Returns:
+        fit (ndarray): Array of polynomial fit values
+    """
+    a, b, c, d, e, f = params
+    fit = (a + b*x + c*y + d*x**2 + e*y**2 + f*x*y)
+    return fit
+
+
+def mp(a, b):
+    return matrix(a) * matrix(b)
+
+
+def twopave(x):
+    return (x[0:-1]+x[1:])/2.
+
+
+def diff1(var):
+
+    if var.ndim == 1:
+        z = var[:]
+        zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+        zc = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+        dz = diff(zc)[1:-1]  # d\psi /dz (N+2)   diff()计算差分 (N+1)
+        return dz
+    elif var.ndim == 2:
+        zc = np.zeros([var.shape[0] + 3, var.shape[1]])
+        for i in range(var.shape[1]):
+            z = var[:, i]
+            zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+            zc[:, i] = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+        return diff(zc, axis=0)[1:-1, :]
+    elif var.ndim == 3:
+        zc = np.zeros([var.shape[0] + 3, var.shape[1], var.shape[2]])
+        for i in range(var.shape[1]):
+            for j in range(var.shape[2]):
+                z = var[:, i, j]
+                zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+                zc[:, i, j] = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+        return diff(zc, axis=0)[1:-1, :, :]
+
+
+def odes(x, y, z, N2, f0, filterL, bsa, ssha):
+    """
+    生成求解方程所需的的系数矩阵
+    :param x, y: 经纬度对应的xy坐标
+    :param z: 深度分层
+    :param N2: 浮力频率（也叫做"垂直分层剖面"）
+    :param f0: 科里奥利参数
+    :param filterL: 滤波临界值
+    :param bs: 表面浮力
+    :return: psis(表面流函数)，psii(内部流函数)
+    """
+    ny, nx = x.shape
+    dx = np.c_[diff(x, axis=1), x[:, -1] + (x[:, -1] - x[:, -2])]
+    dy = np.r_[diff(y, axis=0), (y[-1, :] + (y[-1, :] - y[-2, :])).reshape(1, -1)]
+    k = 2 * pi * fft.fftfreq(nx)
+    l = 2 * pi * fft.fftfreq(ny)
+
+    ck, cl = 2 * pi / filterL, 2 * pi / filterL
+    bhat = (fft.fft2(bsa))
+    sshahat = (fft.fft2(ssha))
+
+    nz = len(z)
+    dz = diff1(z)
+    zf = np.r_[z[0] - (z[1] - z[0]), z, z[-1] + (z[-1] - z[-2])]  # N+1——>N+3
+    zc = np.r_[zf[0] - 0.5 * (zf[1] - zf[0]), twopave(zf), zf[-1] + 0.5 * (zf[-1] - zf[-2])]  # N+4 \psi points
+    dzc = diff(zc[1:])
+    mx = matrix
+    R1 = mx(np.zeros((nz, 1)))
+    R1[0] = 1.
+    S = mx(diag(r_[f0 ** 2 / N2, f0 ** 2 / N2[-1]]))  # N+2 * N+2
+    D1 = mx(mp(diag(1. / dzc), diff(-identity(nz + 1), axis=1)))  # N+2 * N+1
+    D1[[0, -1], :] = 0
+    D2 = mx(mp(diag(1. / dz), diff(identity(nz + 1), axis=0)))  # N+1 * N+2
+    M = D2 * S * D1
+
+    '''for i in range(nz):
+        M[i, :] = 1/(f0**2) * N[i, :]'''
+
+    M1 = copy.deepcopy(M)  # M1(线性系统左端的第一个系数矩阵）
+    M1[0, 0] = 1. / dz[0]
+    M1[0, 1] = -1. / dz[0]
+    M1[-1, -2] = 1. / dz[-1]
+    M1[-1, -1] = -1. / dz[-1]
+
+    # loop through wavenumbers
+    bhats = np.zeros_like(bhat)
+    psishat = np.zeros((nz, ny, nx), dtype=complex)
+    for ik in np.arange(k.size):
+        for il in np.arange(l.size):
+            wv2 = ((k[ik] / dx[il, ik]) ** 2 + (l[il] / dy[il, ik]) ** 2)
+            if wv2 > (ck * ck + cl * cl):
+                bhats[il, ik] = bhat[il, ik]
+                right = bhat[il, ik] / f0 * R1  # Nz+1 * 1  right R=b/f*[1,0,...,0]T
+                left = M1 - wv2 * np.eye(nz)  # Nz+1 * Nz+1  left M1-M2
+                psishat[:, il, ik] = np.linalg.solve(left, right).flatten()
+            else:
+                print('skip k(ik,il)', ik, il, "wv2 = ", wv2)
+    psishat1 = np.zeros_like(psishat)
+    for i in range(0, nz):
+        psishat1[i, :, :] = fft.ifft2(psishat[i, :, :])
+    psis= np.real(psishat1)
+
+    # psii
+    R, F = np.linalg.eig(M)
+    F = F[:, np.argsort(abs(R))]
+    m0, m1 = 0, 1  # m=0 is the barotropic mode，m=1 is the first baroclinic modes.
+
+    psihat = g * sshahat / f0
+    delta = F[-1, m0] * F[0, m1] - F[0, m0] * F[-1, m1]
+
+    A0 = np.zeros([len(l), len(k)], dtype=complex)
+    A1 = np.zeros_like(A0)
+    psiihat = np.zeros_like(psishat)
+    for ik in np.arange(k.size):
+        for il in np.arange(l.size):
+            wv2 = ((k[ik] / dx[il, ik]) ** 2 + (l[il] / dy[il, ik]) ** 2)  # K=k^2+l^2
+            if wv2 > (ck * ck + cl * cl):
+                A0[il, ik] = (psishat[0, il, ik] * F[-1, m1] - psishat[-1, il, ik] * F[0, m1] - psihat[il, ik] * F[
+                    -1, m1]) / delta  # A0
+                A1[il, ik] = (psishat[-1, il, ik] * F[0, m0] - psishat[0, il, ik] * F[-1, m0] + psihat[il, ik] * F[
+                    -1, m0]) / delta  # A1
+
+            else:
+                print('skip k(ik,il)', ik, il, "wv2 = ", wv2)
+    psiihat1 = np.zeros_like(psiihat)
+    for i in range(0, nz):
+        psiihat[i, :, :] = A0 * F[i, m0] + A1 * F[i, m1]
+        psiihat1[i, :, :] = fft.ifft2(psiihat[i, :, :])
+    psii = np.real(psiihat1)
+    return psis, psii
+
+
+def difference(x, y, d):
+    """
+            Calculate the x and y gradients of a field
+    :param x, y: x,y is the grid coordinates of latitude and longitude
+    :param d: d is a 2D or 3D function(stream function)
+    :return: Partial derivatives of d to x and y
+    """
+    x = c_[x, x[:, -2]]  # [m, n+1]
+    y = r_[y, y[-2, :].reshape(1, -1)]  # [m+1, n]
+    if d.ndim == 2:
+        d_x = c_[d, d[:, -2]]
+        d1 = diff(d_x, axis=1)
+        x1 = diff(x, axis=1)
+        v0 = d1 / x1
+        # v[:, -1] = v[:, -2]  # [m, n]  ??????
+        d_y = r_[d, d[-2, :].reshape(1, -1)]
+        d2 = diff(d_y, axis=0)
+        y1 = diff(y, axis=0)
+        u0 = d2 / y1
+        # u[-1, :] = u[-2, :]  # [m, n]  ????
+    if d.ndim == 3:
+        u0, v0 = zeros(d.shape), zeros(d.shape)
+        for i in range(d.shape[0]):
+            d_x = c_[d[i, :, :], d[i, :, -1]]  # .reshape(-1, -1, 1)]
+            d_y = r_[d[i, :, :], d[i, -1, :].reshape(1, -1)]
+            v0[i, :, :] = diff(d_x, axis=1)/diff(x, axis=1)
+            u0[i, :, :] = diff(d_y, axis=0)/diff(y, axis=0)
+    return u0, v0
+
+
+def velocity(x, y, d):
+    """
+                Calculate the e horizontal velocities of a field
+        :param x, y: x,y is the grid coordinates of latitude and longitude
+        :param d: d is a 3D function(stream function)
+        :return:
+         u: zonal velocities
+         v: meridional velocities
+        """
+    u, v = zeros(d.shape), zeros(d.shape)
+    for i in range(d.shape[0]):
+        ut, vt = difference(x, y, d[i, :, :])
+        v[i, :, :] = vt
+        u[i, :, :] = ut
+    u = -u
+    return u, v
+
+d = nc.Dataset('path')
+
+lon = d['lon'][:]
+lat = d['lat'][:]
+z = d['depth'][:]
+ssh = d['ssh'][:]
+pd = d['density'][:]
+ssd = pd[0, :, :]
+rho0 = np.mean(ssd)
+
+ssda = anomaly(lon, lat, ssd)
+ssha = anomaly(lon, lat, ssh)
+
+# Calculates the Coriolis parameter from the latitude
+f0 = 4.0*pi/(24*3600)*sin(lat.mean()*pi/180.0)
+
+g = 9.81
+bsa = -g*ssda/rho0
+
+# coordinate
+x, y = lonlatxy(lon, lat)
+
+# low-pass filter
+filterL = 1e10
+
+# Find QG equation
+N2 = d['N20'][:]  # 33 * 176 * 351
+psis, psii = odes(x, y, z, N2, f0, filterL, bsa, ssha)
+
+psit = psis + psii
+
+# density anomaly
+dz = diff1(-z)
+rhot = -rho0 * f0 / g * diff1(psit) / dz.reshape(-1, 1, 1)
+
+# velocity
+u, v = velocity(x, y, psit)  # 3D
